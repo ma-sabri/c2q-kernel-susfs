@@ -6,7 +6,7 @@ on:
 jobs:
   build:
     name: Compile SM8250 Kernel
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-latest
     steps:
       - name: Maximize Build Space & Install Dependencies
         run: |
