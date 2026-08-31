@@ -18,8 +18,14 @@ jobs:
 
       - name: Clone Google Prebuilt Clang (r383902 - Android 11 Toolchain)
         run: |
-          git clone --depth=1 https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/clang-r383902 clang
+      - name: Clone Google Prebuilt Clang (r383902 - Android 11 Toolchain)
+        run: |
+          git clone --depth=1 https://github.com/android/platform-tools-prebuilts-clang.git clang || \
+          git clone --depth=1 https://gitlab.com/android/prebuilts/clang.git clang
           echo "$GITHUB_WORKSPACE/clang/bin" >> $GITHUB_PATH
+
+          #git clone --depth=1 https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/clang-r383902 clang
+          #echo "$GITHUB_WORKSPACE/clang/bin" >> $GITHUB_PATH
 
       - name: Clone Samsung SM8250 Kernel Source
         run: |
