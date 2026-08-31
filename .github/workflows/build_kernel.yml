@@ -1,88 +1,64 @@
-name: Build Samsung SM8250 Kernel with SuSFS
+name: Build Note 20 Ultra (c2q) KernelSU-Next + SuSFS
 
 on:
   workflow_dispatch:
-    inputs:
-      clang_tarball_url:
-        description: 'Optional: URL to clang prebuilt tarball (CI network can download if googlesource blocked)'
-        required: false
 
 jobs:
   build:
     name: Compile SM8250 Kernel
     runs-on: ubuntu-latest
     steps:
-      - name: Maximize Build Space & Install Dependencies
+      - name: Maximize Build Environment & Install System Clang Toolchain
         run: |
-          sudo rm -rf /usr/share/dotnet /etc/mysql /etc/php /usr/local/lib/android || true
+          sudo rm -rf /usr/share/dotnet /etc/mysql /etc/php /usr/local/lib/android
           sudo apt update
           sudo apt install -y git cpio tar xz-utils bc bison flex libssl-dev make gcc g++ \
-                              gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
-                              gcc-arm-linux-gnueabi binutils-arm-linux-gnueabi libelf-dev ca-certificates curl
+                              clang lld llvm gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+                              gcc-arm-linux-gnueabi binutils-arm-linux-gnueabi libelf-dev
 
-      - name: Attempt to install or fetch Clang
+      - name: Clone postkevone/c2q-kernelsu-next Source
         run: |
-          set -e
-          # If a prebuilt clang tarball URL was provided as workflow input, try download+extract.
-          if [ -n "${{ github.event.inputs.clang_tarball_url }}" ]; then
-            echo "Downloading clang prebuilt from provided URL..."
-            curl -fsSL "${{ github.event.inputs.clang_tarball_url }}" -o clang.tar.gz
-            mkdir -p clang-prebuilt
-            tar -xzf clang.tar.gz -C clang-prebuilt --strip-components=1 || true
-            export PATH="$PWD/clang-prebuilt/bin:$PATH"
-            echo "Using downloaded clang: $(clang --version | head -n1 || true)"
-          else
-            echo "No clang tarball URL provided; installing system clang/llvm fallback"
-            sudo apt-get update
-            sudo apt-get install -y clang llvm
-            echo "clang version: $(clang --version | head -n1)"
-          fi
+          git clone --depth=1 https://github.com/postkevone/c2q-kernelsu-next.git kernel
+          cd kernel
+          git submodule update --init --recursive || true
 
-      - name: Mark workspace safe for git operations
-        run: |
-          # Avoid interactive credential prompts in CI; cause git to fail instead of prompt
-          export GIT_TERMINAL_PROMPT=0
-          git config --global --add safe.directory $GITHUB_WORKSPACE || true
-
-      - name: Checkout kernel source
-        uses: actions/checkout@v4
-        with:
-          repository: 'Gorhanhee/android_kernel_samsung_c2q'
-          path: kernel
-          fetch-depth: 1
-          token: ${{ secrets.GITHUB_TOKEN }}
-          submodules: true
-
-      - name: Integrate KernelSU-Next & SuSFS
+      - name: Apply SuSFS 4.19 Kernel Patches & Configure Defconfig
         working-directory: kernel
         run: |
-          set -e
-          # Prefer cloning the repo and running the setup script locally to avoid pipes
-          if ! [ -d ksunext ]; then
-            git clone https://github.com/rifsxd/KernelSU-Next.git ksunext || true
-          fi
-          if [ -d ksunext ]; then
-            bash ksunext/kernel/setup.sh next || true
-          else
-            echo "Warning: KernelSU-Next not available; continuing"
-          fi
+          # 1. Fetch SuSFS 4.19 Patches
+          git clone https://gitlab.com/simonpunk/susfs4ksu.git -b kernel-4.19 susfs
 
-          # Apply SuSFS patches (best-effort)
-          git clone https://gitlab.com/simonpunk/susfs4ksu.git -b kernel-4.19 susfs || true
+          # 2. Copy SuSFS core patches into kernel tree
+          cp -r susfs/kernel_patches/include/linux/susfs* include/linux/ 2>/dev/null || true
+          cp -r susfs/kernel_patches/fs/susfs* fs/ 2>/dev/null || true
           cp susfs/kernel_patches/fs/* fs/ 2>/dev/null || true
           cp susfs/kernel_patches/include/linux/* include/linux/ 2>/dev/null || true
 
-          cp susfs/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch ./ 2>/dev/null || true
-          if [ -f 10_enable_susfs_for_ksu.patch ]; then
-            patch -p1 < 10_enable_susfs_for_ksu.patch || true
+          # 3. Patch KernelSU-Next with SuSFS support
+          if [ -f "susfs/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch" ]; then
+            patch -p1 < susfs/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch || true
           fi
-          cp -r susfs/kernel_patches/include/linux/susfs* include/linux/ 2>/dev/null || true
-          cp -r susfs/kernel_patches/fs/susfs* fs/ 2>/dev/null || true
 
-      - name: Build Kernel Image
+          # 4. Modify Defconfig inside kernelsu-defconfig as instructed by the author
+          TARGET_DEFCONFIG=$(find kernelsu-defconfig/ arch/arm64/configs/ -name "*kona*" -o -name "*c2q*" -o -name "*perf_defconfig*" | head -n 1)
+          echo "[*] Appending SuSFS configuration to: $TARGET_DEFCONFIG"
+
+          cat << 'EOF' >> "$TARGET_DEFCONFIG"
+          CONFIG_KSU=y
+          CONFIG_KSU_SUSFS=y
+          CONFIG_SUSFS=y
+          CONFIG_KSU_SUSFS_SUS_PATH=y
+          CONFIG_KSU_SUSFS_SUS_MOUNT=y
+          CONFIG_KSU_SUSFS_SUS_KSTAT=y
+          CONFIG_KSU_SUSFS_SUS_SU=y
+          CONFIG_KSU_SUSFS_ENABLE_LOG=y
+          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y
+          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y
+          EOF
+
+      - name: Compile Kernel Image with System Clang
         working-directory: kernel
         run: |
-          set -e
           mkdir -p out
           export ARCH=arm64
           export SUBARCH=arm64
@@ -90,40 +66,36 @@ jobs:
           export CLANG_TRIPLE=aarch64-linux-gnu-
           export CROSS_COMPILE=aarch64-linux-gnu-
           export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+          export HOSTCC=clang
+          export HOSTCXX=clang++
 
-          # 1. Defconfig
-          make ARCH=arm64 O=out CC=${CC} CLANG_TRIPLE=${CLANG_TRIPLE} vendor/kona-perf_defconfig || true
+          # Detect primary defconfig target
+          DEFCONFIG_NAME="vendor/kona-perf_defconfig"
+          if [ -f "arch/arm64/configs/c2q_defconfig" ]; then
+            DEFCONFIG_NAME="c2q_defconfig"
+          fi
 
-          # 2. Enable KernelSU & SuSFS configs (best-effort)
-          scripts/config --file out/.config --enable CONFIG_KSU || true
-          scripts/config --file out/.config --enable CONFIG_KSU_SUSFS || true
-          scripts/config --file out/.config --enable CONFIG_SUSFS || true
-          scripts/config --file out/.config --enable CONFIG_KSU_SUSFS_SUS_PATH || true
-          scripts/config --file out/.config --enable CONFIG_KSU_SUSFS_SUS_MOUNT || true
-          scripts/config --file out/.config --enable CONFIG_KSU_SUSFS_SUS_KSTAT || true
-          scripts/config --file out/.config --enable CONFIG_KSU_SUSFS_SUS_SU || true
-          scripts/config --file out/.config --enable CONFIG_KSU_SUSFS_ENABLE_LOG || true
-          scripts/config --file out/.config --enable CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT || true
-          scripts/config --file out/.config --enable CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT || true
+          make ARCH=arm64 O=out CC=clang CLANG_TRIPLE=aarch64-linux-gnu- "$DEFCONFIG_NAME"
+          make ARCH=arm64 O=out CC=clang CLANG_TRIPLE=aarch64-linux-gnu- olddefconfig
 
-          make ARCH=arm64 O=out CC=${CC} CLANG_TRIPLE=${CLANG_TRIPLE} olddefconfig || true
+          # Compile Image
+          make -j$(nproc --all) ARCH=arm64 O=out \
+            CC=clang \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            HOSTCC=clang \
+            HOSTCXX=clang++ \
+            Image
 
-          # 3. Compile Image (allow failure but continue to artifact collection for debugging)
-          make -j$(nproc) ARCH=arm64 O=out \
-            CC=${CC} \
-            CLANG_TRIPLE=${CLANG_TRIPLE} \
-            CROSS_COMPILE=${CROSS_COMPILE} \
-            CROSS_COMPILE_ARM32=${CROSS_COMPILE_ARM32} \
-            Image || true
+      - name: Verify SuSFS Integration
+        working-directory: kernel
+        run: |
+          echo "=== Auditing Compiled Kernel Binary for SuSFS ==="
+          strings out/arch/arm64/boot/Image | grep -E 'susfs_add_sus_path|SUSFS_VERSION|SUS_PATH_HLIST' | head -n 8 || true
 
       - name: Upload Kernel Image Artifact
-        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: Image-SuSFS-SM8250
-          path: |
-            kernel/out/arch/arm64/boot/Image
-            kernel/out
-
-
-
+          name: Image-c2q-KernelSU-Next-SuSFS
+          path: kernel/out/arch/arm64/boot/Image
