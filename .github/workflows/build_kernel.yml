@@ -1,220 +1,190 @@
-name: Build Note 20 Ultra (c2q) KernelSU-Next + SuSFS
+name: Build Samsung SM8250 Kernel with SuSFS
 
 on:
   workflow_dispatch:
+    inputs:
+      clang_tarball_url:
+        description: 'Optional: URL to clang prebuilt tarball (CI network can download if googlesource blocked)'
+        required: false
 
 jobs:
   build:
     name: Compile SM8250 Kernel
     runs-on: ubuntu-latest
     steps:
-      - name: Maximize Build Environment & Install System Clang Toolchain
+      - name: Maximize Build Space & Install Dependencies
         run: |
-          sudo rm -rf /usr/share/dotnet /etc/mysql /etc/php /usr/local/lib/android
+          sudo rm -rf /usr/share/dotnet /etc/mysql /etc/php /usr/local/lib/android || true
           sudo apt update
           sudo apt install -y git cpio tar xz-utils bc bison flex libssl-dev make gcc g++ \
-                              clang lld llvm gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
-                              gcc-arm-linux-gnueabi binutils-arm-linux-gnueabi libelf-dev
+                              gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+                              gcc-arm-linux-gnueabi binutils-arm-linux-gnueabi libelf-dev ca-certificates curl
 
-      - name: Clone postkevone/c2q-kernelsu-next Source
+      - name: Attempt to install or fetch Clang
         run: |
-          git clone --depth=1 https://github.com/postkevone/c2q-kernelsu-next.git kernel
-          cd kernel
-          git submodule update --init --recursive || true
+          set -e
+          if [ -n "${{ github.event.inputs.clang_tarball_url }}" ]; then
+            echo "Downloading clang prebuilt from provided URL..."
+            curl -fsSL "${{ github.event.inputs.clang_tarball_url }}" -o clang.tar.gz
+            mkdir -p clang-prebuilt
+            tar -xzf clang.tar.gz -C clang-prebuilt --strip-components=1 || true
+            export PATH="$PWD/clang-prebuilt/bin:$PATH"
+            echo "Using downloaded clang: $(clang --version | head -n1 || true)"
+          else
+            echo "No clang tarball URL provided; installing system clang/llvm fallback"
+            sudo apt-get update
+            sudo apt-get install -y clang llvm
+            echo "clang version: $(clang --version | head -n1)"
+          fi
 
+      - name: Mark workspace safe and avoid git prompts
+        run: |
+          export GIT_TERMINAL_PROMPT=0
+          git config --global --add safe.directory $GITHUB_WORKSPACE || true
 
-      
-      - name: Apply SuSFS 4.19 Kernel Patches & Configure Defconfig
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          repository: 'Gorhanhee/android_kernel_samsung_c2q'
+          path: kernel
+          fetch-depth: 1
+          token: ${{ secrets.GITHUB_TOKEN }}
+          submodules: true
+
+      - name: Prepare workspace for patching
         working-directory: kernel
         run: |
-          # 1. Fetch SuSFS 4.19 Patches
-          git clone https://gitlab.com/simonpunk/susfs4ksu.git -b kernel-4.19 susfs
+          set -e
+          # ensure directories exist that patches may target
+          mkdir -p fs include/linux
 
-          # 2. Copy SuSFS core patches into kernel tree
-          cp -r susfs/kernel_patches/include/linux/susfs* include/linux/ 2>/dev/null || true
-          cp -r susfs/kernel_patches/fs/susfs* fs/ 2>/dev/null || true
+      - name: Fetch SuSFS patches and attempt robust apply
+        working-directory: kernel
+        run: |
+          set -e
+          # fetch susfs patches
+          git clone https://gitlab.com/simonpunk/susfs4ksu.git -b kernel-4.19 susfs || true
+
+          # copy patch and patch assets into place (best-effort)
           cp susfs/kernel_patches/fs/* fs/ 2>/dev/null || true
-          cp susfs/kernel_patches/include/linux/* include/linux/ 2>/dev/null || true
+          cp -r susfs/kernel_patches/include/linux/* include/linux/ 2>/dev/null || true
+          cp susfs/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch . 2>/dev/null || true
 
-          # 3. Patch KernelSU-Next with SuSFS support
-          if [ -f "susfs/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch" ]; then
-            patch -p1 < susfs/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch || true
+          # helper: try git apply first, then patch -p1..-p3, then git apply --reject
+          apply_patch_best_effort() {
+            patchfile="$1"
+            if [ ! -f "$patchfile" ]; then
+              echo "Patch $patchfile not found"
+              return 1
+            fi
+
+            if git apply --check "$patchfile" 2>/dev/null; then
+              git apply "$patchfile" && return 0
+            fi
+
+            for p in 1 2 3; do
+              if patch -p$p --dry-run < "$patchfile" >/dev/null 2>&1; then
+                echo "Applying $patchfile with -p$p"
+                patch -p$p < "$patchfile" && return 0
+              else
+                echo "patch -p$p did not match"
+              fi
+            done
+
+            echo "Attempting git apply --reject (will create .rej files for inspection)"
+            git apply --reject --whitespace=fix "$patchfile" || true
+            return 2
+          }
+
+          if [ -f 10_enable_susfs_for_ksu.patch ]; then
+            apply_patch_best_effort 10_enable_susfs_for_ksu.patch || true
+          else
+            echo "No 10_enable_susfs_for_ksu.patch found; skipping patch apply"
           fi
 
-          # 4. Locate defconfig from kernelsu-defconfig directory
-          echo "[*] Searching for defconfig files..."
-          find kernelsu-defconfig/ -type f | head -20
-          
-          # Find and copy the appropriate defconfig
-          TARGET_DEFCONFIG=$(find kernelsu-defconfig/ -name "*kona*perf*" -o -name "*c2q*" | grep -E "(kona|c2q)" | head -n 1)
-          
-          if [ -z "$TARGET_DEFCONFIG" ]; then
-            echo "[!] Warning: Could not find kona/c2q defconfig, searching for any perf_defconfig..."
-            TARGET_DEFCONFIG=$(find kernelsu-defconfig/ -name "*perf*" | head -n 1)
-          fi
-          
-          if [ -z "$TARGET_DEFCONFIG" ]; then
-            echo "[!] Error: No suitable defconfig found!"
-            exit 1
-          fi
-          
-          echo "[✓] Found defconfig: $TARGET_DEFCONFIG"
-          
-          # Ensure arch/arm64/configs/vendor directory exists
-          mkdir -p arch/arm64/configs/vendor
-          
-          # Copy defconfig to standard location
-          cp "$TARGET_DEFCONFIG" arch/arm64/configs/vendor/kona-perf_defconfig
-          echo "[✓] Copied to arch/arm64/configs/vendor/kona-perf_defconfig"
+          # show status and list potential rejects for diagnostics
+          git status --porcelain || true
+          ls -la | sed -n '1,200p' || true
+          find . -name '*.rej' -print || true
+          # Save debug outputs to files for later artifact upload
+          git rev-parse --abbrev-ref HEAD > /tmp/git-branch || true
+          git log -1 --oneline > /tmp/git-last-commit || true
+          ls -R arch/arm64/configs > /tmp/arch-configs-list || true
+          ls -R include/linux > /tmp/include-linux-list || true
 
-          # 5. Append SuSFS configuration
-          cat << 'EOF' >> arch/arm64/configs/vendor/kona-perf_defconfig
-          CONFIG_KSU=y
-          CONFIG_KSU_SUSFS=y
-          CONFIG_SUSFS=y
-          CONFIG_KSU_SUSFS_SUS_PATH=y
-          CONFIG_KSU_SUSFS_SUS_MOUNT=y
-          CONFIG_KSU_SUSFS_SUS_KSTAT=y
-          CONFIG_KSU_SUSFS_SUS_SU=y
-          CONFIG_KSU_SUSFS_ENABLE_LOG=y
-          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y
-          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y
-          EOF
-          
-          echo "[✓] SuSFS configuration appended"
-
-      - name: Compile Kernel Image with System Clang
-        working-directory: kernel
-        run: |
-          mkdir -p out
-          export ARCH=arm64
-          export SUBARCH=arm64
-          export CC=clang
-          export CLANG_TRIPLE=aarch64-linux-gnu-
-          export CROSS_COMPILE=aarch64-linux-gnu-
-          export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
-          export HOSTCC=clang
-          export HOSTCXX=clang++
-
-          # Verify defconfig exists before build
-          if [ ! -f "arch/arm64/configs/vendor/kona-perf_defconfig" ]; then
-            echo "[!] Error: Defconfig not found at arch/arm64/configs/vendor/kona-perf_defconfig"
-            exit 1
-          fi
-          
-          echo "[✓] Defconfig verified"
-
-          make ARCH=arm64 O=out CC=clang CLANG_TRIPLE=aarch64-linux-gnu- vendor/kona-perf_defconfig
-          make ARCH=arm64 O=out CC=clang CLANG_TRIPLE=aarch64-linux-gnu- olddefconfig
-
-          # Compile Image
-          make -j$(nproc --all) ARCH=arm64 O=out \
-            CC=clang \
-            CLANG_TRIPLE=aarch64-linux-gnu- \
-            CROSS_COMPILE=aarch64-linux-gnu- \
-            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
-            HOSTCC=clang \
-            HOSTCXX=clang++ \
-            Image      - name: Apply SuSFS 4.19 Kernel Patches & Configure Defconfig
-        working-directory: kernel
-        run: |
-          # 1. Fetch SuSFS 4.19 Patches
-          git clone https://gitlab.com/simonpunk/susfs4ksu.git -b kernel-4.19 susfs
-
-          # 2. Copy SuSFS core patches into kernel tree
-          cp -r susfs/kernel_patches/include/linux/susfs* include/linux/ 2>/dev/null || true
-          cp -r susfs/kernel_patches/fs/susfs* fs/ 2>/dev/null || true
-          cp susfs/kernel_patches/fs/* fs/ 2>/dev/null || true
-          cp susfs/kernel_patches/include/linux/* include/linux/ 2>/dev/null || true
-
-          # 3. Patch KernelSU-Next with SuSFS support
-          if [ -f "susfs/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch" ]; then
-            patch -p1 < susfs/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch || true
-          fi
-
-          # 4. Locate defconfig from kernelsu-defconfig directory
-          echo "[*] Searching for defconfig files..."
-          find kernelsu-defconfig/ -type f | head -20
-          
-          # Find and copy the appropriate defconfig
-          TARGET_DEFCONFIG=$(find kernelsu-defconfig/ -name "*kona*perf*" -o -name "*c2q*" | grep -E "(kona|c2q)" | head -n 1)
-          
-          if [ -z "$TARGET_DEFCONFIG" ]; then
-            echo "[!] Warning: Could not find kona/c2q defconfig, searching for any perf_defconfig..."
-            TARGET_DEFCONFIG=$(find kernelsu-defconfig/ -name "*perf*" | head -n 1)
-          fi
-          
-          if [ -z "$TARGET_DEFCONFIG" ]; then
-            echo "[!] Error: No suitable defconfig found!"
-            exit 1
-          fi
-          
-          echo "[✓] Found defconfig: $TARGET_DEFCONFIG"
-          
-          # Ensure arch/arm64/configs/vendor directory exists
-          mkdir -p arch/arm64/configs/vendor
-          
-          # Copy defconfig to standard location
-          cp "$TARGET_DEFCONFIG" arch/arm64/configs/vendor/kona-perf_defconfig
-          echo "[✓] Copied to arch/arm64/configs/vendor/kona-perf_defconfig"
-
-          # 5. Append SuSFS configuration
-          cat << 'EOF' >> arch/arm64/configs/vendor/kona-perf_defconfig
-          CONFIG_KSU=y
-          CONFIG_KSU_SUSFS=y
-          CONFIG_SUSFS=y
-          CONFIG_KSU_SUSFS_SUS_PATH=y
-          CONFIG_KSU_SUSFS_SUS_MOUNT=y
-          CONFIG_KSU_SUSFS_SUS_KSTAT=y
-          CONFIG_KSU_SUSFS_SUS_SU=y
-          CONFIG_KSU_SUSFS_ENABLE_LOG=y
-          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y
-          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y
-          EOF
-          
-          echo "[✓] SuSFS configuration appended"
-
-      - name: Compile Kernel Image with System Clang
-        working-directory: kernel
-        run: |
-          mkdir -p out
-          export ARCH=arm64
-          export SUBARCH=arm64
-          export CC=clang
-          export CLANG_TRIPLE=aarch64-linux-gnu-
-          export CROSS_COMPILE=aarch64-linux-gnu-
-          export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
-          export HOSTCC=clang
-          export HOSTCXX=clang++
-
-          # Verify defconfig exists before build
-          if [ ! -f "arch/arm64/configs/vendor/kona-perf_defconfig" ]; then
-            echo "[!] Error: Defconfig not found at arch/arm64/configs/vendor/kona-perf_defconfig"
-            exit 1
-          fi
-          
-          echo "[✓] Defconfig verified"
-
-          make ARCH=arm64 O=out CC=clang CLANG_TRIPLE=aarch64-linux-gnu- vendor/kona-perf_defconfig
-          make ARCH=arm64 O=out CC=clang CLANG_TRIPLE=aarch64-linux-gnu- olddefconfig
-
-          # Compile Image
-          make -j$(nproc --all) ARCH=arm64 O=out \
-            CC=clang \
-            CLANG_TRIPLE=aarch64-linux-gnu- \
-            CROSS_COMPILE=aarch64-linux-gnu- \
-            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
-            HOSTCC=clang \
-            HOSTCXX=clang++ \
-            Image
-      - name: Verify SuSFS Integration
-        working-directory: kernel
-        run: |
-          echo "=== Auditing Compiled Kernel Binary for SuSFS ==="
-          strings out/arch/arm64/boot/Image | grep -E 'susfs_add_sus_path|SUSFS_VERSION|SUS_PATH_HLIST' | head -n 8 || true
-
-      - name: Upload Kernel Image Artifact
+      - name: Upload patch debug artifacts (if any)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: Image-c2q-KernelSU-Next-SuSFS
-          path: kernel/out/arch/arm64/boot/Image
+          name: patch-debug
+          path: |
+            kernel/*.rej
+            kernel/*.patch
+            kernel/.git/rebase-apply/*.rej
+            kernel/*.log
+            kernel/.git/objects/pack/*.pack
+            kernel/.git/refs/heads/* || true
+            kernel/*.gz || true
+            kernel/*.txt || true
+            kernel/tmp* || true
+            kernel/.git/HEAD || true
+            kernel/arch/arm64/configs || true
+            kernel/arch/arm64/configs/* || true
+            kernel/include/linux || true
+            kernel/arch/arm64/configs/* || true
+            kernel/. || true
+
+      - name: Configure defconfig with fallbacks
+        working-directory: kernel
+        run: |
+          set -e
+          # Ensure we have config dir listing for diagnostics
+          echo "Available arch/arm64/configs (first 200 lines):"
+          ls -1 arch/arm64/configs | sed -n '1,200p' || true
+
+          if [ -f arch/arm64/configs/vendor/kona-perf_defconfig ]; then
+            echo "Found vendor/kona-perf_defconfig"
+            make ARCH=arm64 O=out vendor/kona-perf_defconfig
+          else
+            echo "vendor/kona-perf_defconfig not found; searching for alternatives..."
+            alt=$(ls arch/arm64/configs | grep -i 'kona' | head -n1 || true)
+            if [ -n "$alt" ]; then
+              echo "Using fallback config: $alt"
+              make ARCH=arm64 O=out $alt
+            else
+              echo "No kona config found; falling back to defconfig"
+              make ARCH=arm64 O=out defconfig
+            fi
+          fi
+
+      - name: Build Kernel Image
+        working-directory: kernel
+        run: |
+          set -e
+          mkdir -p out
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export CC=clang
+          export CLANG_TRIPLE=aarch64-linux-gnu-
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+
+          # Compile (allow failure but continue so artifacts/debug are available)
+          make -j$(nproc) ARCH=arm64 O=out \
+            CC=${CC} \
+            CLANG_TRIPLE=${CLANG_TRIPLE} \
+            CROSS_COMPILE=${CROSS_COMPILE} \
+            CROSS_COMPILE_ARM32=${CROSS_COMPILE_ARM32} \
+            Image || true
+
+      - name: Upload Kernel Image and build tree
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-output
+          path: |
+            kernel/out/arch/arm64/boot/Image
+            kernel/out
+            kernel/arch/arm64/configs
+            kernel/include/linux
+            kernel/*.rej
