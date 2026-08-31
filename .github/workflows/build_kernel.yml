@@ -16,11 +16,10 @@ jobs:
                               gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
                               gcc-arm-linux-gnueabi binutils-arm-linux-gnueabi libelf-dev
 
-      - name: Clone Google Prebuilt Clang (r383902 - Android 11 Toolchain)
-        run: |
       - name: Install Clang
         run: |
           sudo apt install -y clang llvm
+
       - name: Clone Samsung SM8250 Kernel Source
         run: |
           git clone --depth=1 https://github.com/Gorhanhee/android_kernel_samsung_c2q.git kernel
